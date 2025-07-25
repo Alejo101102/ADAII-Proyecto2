@@ -4,6 +4,8 @@ import os
 import subprocess
 import tempfile
 import threading
+import queue
+import time
 
 class MinExtGUI:
     def __init__(self, root):
@@ -16,7 +18,15 @@ class MinExtGUI:
         self.archivo_entrada = None
         self.archivo_modelo = None
         
+        # Cola para comunicación entre hilos
+        self.mensaje_queue = queue.Queue()
+        
+        # Variable para controlar el proceso en ejecución
+        self.proceso_activo = None
+        self.hilo_activo = None
+        
         self.crear_interfaz()
+        self.iniciar_monitor_cola()
     
     def crear_interfaz(self):
         # Frame principal
@@ -54,21 +64,55 @@ class MinExtGUI:
         ttk.Button(archivos_frame, text="Buscar", 
                   command=self.seleccionar_archivo_modelo).grid(row=1, column=2, pady=(0, 5))
         
-        # Botón principal de ejecución
+        # Frame de configuración avanzada
+        config_frame = ttk.LabelFrame(main_frame, text="Configuración Avanzada", padding="10")
+        config_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Timeout
+        ttk.Label(config_frame, text="Timeout (segundos):").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        self.timeout_var = tk.StringVar(value="300")  # 5 minutos por defecto
+        timeout_entry = ttk.Entry(config_frame, textvariable=self.timeout_var, width=10)
+        timeout_entry.grid(row=0, column=1, sticky=tk.W)
+        
+        # Solver
+        ttk.Label(config_frame, text="Solver:").grid(row=0, column=2, sticky=tk.W, padx=(20, 10))
+        self.solver_var = tk.StringVar(value="Gecode")
+        solver_combo = ttk.Combobox(config_frame, textvariable=self.solver_var, 
+                                   values=["Gecode", "Chuffed", "COIN-BC", "OR-Tools"], 
+                                   state="readonly", width=12)
+        solver_combo.grid(row=0, column=3, sticky=tk.W)
+        
+        # Número de hilos
+        ttk.Label(config_frame, text="Hilos:").grid(row=0, column=4, sticky=tk.W, padx=(20, 10))
+        self.threads_var = tk.StringVar(value="auto")
+        threads_entry = ttk.Entry(config_frame, textvariable=self.threads_var, width=8)
+        threads_entry.grid(row=0, column=5, sticky=tk.W)
+        
+        # Botones principales
         ejecutar_frame = ttk.Frame(main_frame)
-        ejecutar_frame.grid(row=2, column=0, columnspan=3, pady=(10, 20))
+        ejecutar_frame.grid(row=3, column=0, columnspan=3, pady=(10, 20))
         
         self.btn_ejecutar = ttk.Button(ejecutar_frame, text="Ejecutar Modelo MinExt", 
                                       command=self.ejecutar_modelo, style="Accent.TButton")
-        self.btn_ejecutar.pack(pady=10)
+        self.btn_ejecutar.pack(side=tk.LEFT, padx=(0, 10))
         
-        # Progress bar
-        self.progress = ttk.Progressbar(ejecutar_frame, mode='indeterminate')
-        self.progress.pack(fill=tk.X, pady=(5, 0))
+        self.btn_cancelar = ttk.Button(ejecutar_frame, text="Cancelar", 
+                                      command=self.cancelar_ejecucion, state='disabled')
+        self.btn_cancelar.pack(side=tk.LEFT)
+        
+        # Progress bar con información
+        progress_frame = ttk.Frame(ejecutar_frame)
+        progress_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        self.progress = ttk.Progressbar(progress_frame, mode='indeterminate')
+        self.progress.pack(fill=tk.X)
+        
+        self.status_label = ttk.Label(progress_frame, text="Listo para ejecutar")
+        self.status_label.pack(pady=(5, 0))
         
         # Área de resultados
         resultados_frame = ttk.LabelFrame(main_frame, text="Resultados", padding="10")
-        resultados_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        resultados_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         resultados_frame.columnconfigure(0, weight=1)
         resultados_frame.rowconfigure(0, weight=1)
         
@@ -80,7 +124,7 @@ class MinExtGUI:
         
         # Frame para botones adicionales
         botones_frame = ttk.Frame(main_frame)
-        botones_frame.grid(row=4, column=0, columnspan=3, pady=(10, 0))
+        botones_frame.grid(row=5, column=0, columnspan=3, pady=(10, 0))
         
         ttk.Button(botones_frame, text="Limpiar Resultados", 
                   command=self.limpiar_resultados).pack(side=tk.LEFT, padx=(0, 10))
@@ -90,7 +134,30 @@ class MinExtGUI:
                   command=self.convertir_archivos).pack(side=tk.LEFT)
         
         # Configurar weights para redimensionamiento
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(4, weight=1)
+    
+    def iniciar_monitor_cola(self):
+        """Monitorea la cola de mensajes y actualiza la interfaz"""
+        try:
+            while True:
+                mensaje_tipo, contenido = self.mensaje_queue.get_nowait()
+                
+                if mensaje_tipo == "texto":
+                    self.texto_resultados.insert(tk.END, contenido)
+                    self.texto_resultados.see(tk.END)
+                elif mensaje_tipo == "status":
+                    self.status_label.config(text=contenido)
+                elif mensaje_tipo == "finalizar":
+                    self.finalizar_ejecucion()
+                elif mensaje_tipo == "error":
+                    messagebox.showerror("Error", contenido)
+                    self.finalizar_ejecucion()
+                    
+        except queue.Empty:
+            pass
+        
+        # Programar la próxima verificación
+        self.root.after(100, self.iniciar_monitor_cola)
     
     def seleccionar_archivo_entrada(self):
         archivo = filedialog.askopenfilename(
@@ -150,27 +217,29 @@ class MinExtGUI:
         return "\n".join(dzn)
     
     def ejecutar_modelo_thread(self):
-        """Ejecuta el modelo en un hilo separado"""
+        """Ejecuta el modelo en un hilo separado con optimizaciones"""
         temp_dzn_path = None
+        start_time = time.time()
+        
         try:
-            # depuración
-            self.root.after(0, lambda: self.mostrar_mensaje(f"[DEBUG] self.archivo_entrada: {self.archivo_entrada}\n"))
-            self.root.after(0, lambda: self.mostrar_mensaje(f"[DEBUG] self.archivo_modelo: {self.archivo_modelo}\n"))
-
             # Validar archivos
             if not self.archivo_entrada or not os.path.exists(self.archivo_entrada):
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Por favor selecciona un archivo de entrada válido.\n[DEBUG] Valor: {self.archivo_entrada}"))
+                self.mensaje_queue.put(("error", f"Por favor selecciona un archivo de entrada válido.\nArchivo: {self.archivo_entrada}"))
                 return
 
             if not self.archivo_modelo or not os.path.exists(self.archivo_modelo):
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Por favor selecciona un archivo de modelo válido.\n[DEBUG] Valor: {self.archivo_modelo}"))
+                self.mensaje_queue.put(("error", f"Por favor selecciona un archivo de modelo válido.\nArchivo: {self.archivo_modelo}"))
                 return
 
+            # Actualizar status
+            self.mensaje_queue.put(("status", "Leyendo archivos..."))
+            
             # Leer archivo de entrada
             with open(self.archivo_entrada, 'r', encoding='utf-8') as f:
                 contenido_entrada = f.read()
 
             # Convertir a formato DZN
+            self.mensaje_queue.put(("status", "Convirtiendo formato..."))
             contenido_dzn = self.convertir_contenido_txt_a_dzn(contenido_entrada)
 
             # Crear archivo temporal DZN
@@ -178,41 +247,109 @@ class MinExtGUI:
                 temp_dzn.write(contenido_dzn)
                 temp_dzn_path = temp_dzn.name
 
-            # Mostrar progreso
-            self.root.after(0, lambda: self.mostrar_mensaje("Ejecutando modelo MiniZinc...\n"))
-            self.root.after(0, lambda: self.mostrar_mensaje(f"Archivo de entrada: {self.archivo_entrada}\n"))
-            self.root.after(0, lambda: self.mostrar_mensaje(f"Archivo de modelo: {self.archivo_modelo}\n\n"))
+            # Mostrar información inicial
+            self.mensaje_queue.put(("texto", f"=== EJECUTANDO MODELO MINEXT ===\n"))
+            self.mensaje_queue.put(("texto", f"Inicio: {time.strftime('%H:%M:%S')}\n"))
+            self.mensaje_queue.put(("texto", f"Archivo de entrada: {os.path.basename(self.archivo_entrada)}\n"))
+            self.mensaje_queue.put(("texto", f"Archivo de modelo: {os.path.basename(self.archivo_modelo)}\n"))
 
-            # Ejecutar MiniZinc
-            cmd = ['minizinc', '--solver', 'Gecode', self.archivo_modelo, temp_dzn_path]
+            # Construir comando optimizado
+            cmd = ['minizinc']
+            
+            # Añadir solver
+            solver = self.solver_var.get()
+            cmd.extend(['--solver', solver])
+            
+            # Añadir configuración de hilos
+            threads = self.threads_var.get().strip()
+            if threads and threads.lower() != 'auto':
+                try:
+                    thread_num = int(threads)
+                    if thread_num > 0:
+                        cmd.extend(['-p', str(thread_num)])
+                except ValueError:
+                    pass
+            
+            # Añadir timeout
+            try:
+                timeout_val = int(self.timeout_var.get())
+                if timeout_val > 0:
+                    cmd.extend(['--time-limit', str(timeout_val * 1000)])  # MiniZinc usa milisegundos
+            except ValueError:
+                pass
+            
+            # Optimizaciones adicionales
+            cmd.extend([
+                '--statistics',  # Mostrar estadísticas
+                '--verbose-solving'  # Información del proceso de resolución
+            ])
+            
+            # Añadir archivos
+            cmd.extend([self.archivo_modelo, temp_dzn_path])
 
-            self.root.after(0, lambda: self.mostrar_mensaje("Ejecutando comando: " + " ".join(cmd) + "\n\n"))
+            self.mensaje_queue.put(("texto", f"Solver: {solver}\n"))
+            self.mensaje_queue.put(("texto", f"Comando: {' '.join(cmd)}\n\n"))
+            self.mensaje_queue.put(("status", f"Resolviendo con {solver}..."))
 
-            process = subprocess.Popen(
+            # Ejecutar MiniZinc con comunicación en tiempo real
+            self.proceso_activo = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                bufsize=1,  # Buffer de línea para salida inmediata
+                universal_newlines=True
             )
 
-            stdout, stderr = process.communicate()
+            # Leer salida en tiempo real
+            stdout_lines = []
+            stderr_lines = []
+            
+            # Leer stdout
+            while True:
+                if self.proceso_activo.poll() is not None:
+                    break
+                
+                try:
+                    line = self.proceso_activo.stdout.readline()
+                    if line:
+                        stdout_lines.append(line)
+                        # Mostrar líneas importantes inmediatamente
+                        if any(keyword in line.lower() for keyword in ['extremismo', 'costo', 'movimientos', 'resultado']):
+                            self.mensaje_queue.put(("texto", line))
+                except:
+                    break
+            
+            # Obtener salida restante
+            remaining_stdout, stderr = self.proceso_activo.communicate()
+            if remaining_stdout:
+                stdout_lines.append(remaining_stdout)
+            if stderr:
+                stderr_lines.append(stderr)
+            
+            stdout = ''.join(stdout_lines)
+            stderr = ''.join(stderr_lines)
+            
+            elapsed_time = time.time() - start_time
 
             # Mostrar resultados
-            if process.returncode == 0:
-                self.root.after(0, lambda: self.mostrar_mensaje("=== RESULTADOS ===\n"))
-                self.root.after(0, lambda: self.mostrar_mensaje(stdout))
+            if self.proceso_activo.returncode == 0:
+                self.mensaje_queue.put(("texto", f"\n=== RESULTADOS ({elapsed_time:.2f}s) ===\n"))
+                self.mensaje_queue.put(("texto", stdout))
                 if stderr:
-                    self.root.after(0, lambda: self.mostrar_mensaje("\n=== ADVERTENCIAS ===\n"))
-                    self.root.after(0, lambda: self.mostrar_mensaje(stderr))
+                    self.mensaje_queue.put(("texto", "\n=== INFORMACIÓN DEL SOLVER ===\n"))
+                    self.mensaje_queue.put(("texto", stderr))
+                self.mensaje_queue.put(("status", f"Completado en {elapsed_time:.2f}s"))
             else:
                 error_msg = stderr if stderr else stdout
-                self.root.after(0, lambda msg=error_msg: self.mostrar_mensaje("Error al ejecutar el modelo:\n"))
-                self.root.after(0, lambda msg=error_msg: self.mostrar_mensaje(msg))
+                self.mensaje_queue.put(("texto", f"\n=== ERROR ({elapsed_time:.2f}s) ===\n"))
+                self.mensaje_queue.put(("texto", error_msg))
+                self.mensaje_queue.put(("status", "Error en la ejecución"))
 
         except Exception as e:
-            error_str = str(e)
-            self.root.after(0, lambda msg=error_str: messagebox.showerror("Error", f"Error durante la ejecución: {msg}"))
+            elapsed_time = time.time() - start_time
+            self.mensaje_queue.put(("error", f"Error durante la ejecución ({elapsed_time:.2f}s):\n{str(e)}"))
 
         finally:
             # Limpiar archivo temporal
@@ -222,31 +359,57 @@ class MinExtGUI:
                 except:
                     pass
 
-            # Detener progress bar y habilitar botón
-            self.root.after(0, self.finalizar_ejecucion)
+            # Limpiar proceso
+            self.proceso_activo = None
+            self.mensaje_queue.put(("finalizar", None))
+    
+    def cancelar_ejecucion(self):
+        """Cancela la ejecución actual"""
+        if self.proceso_activo:
+            try:
+                self.proceso_activo.terminate()
+                self.mensaje_queue.put(("texto", "\n=== EJECUCIÓN CANCELADA ===\n"))
+                self.mensaje_queue.put(("status", "Cancelado por el usuario"))
+            except:
+                pass
+        
+        if self.hilo_activo and self.hilo_activo.is_alive():
+            # El hilo se detendrá cuando detecte que el proceso fue terminado
+            pass
     
     def finalizar_ejecucion(self):
         """Finaliza la ejecución y restaura el estado de la interfaz"""
         self.progress.stop()
         self.btn_ejecutar.config(state='normal')
+        self.btn_cancelar.config(state='disabled')
+        self.proceso_activo = None
+        self.hilo_activo = None
     
     def ejecutar_modelo(self):
+        # Validar configuración
+        try:
+            timeout_val = int(self.timeout_var.get())
+            if timeout_val <= 0:
+                messagebox.showerror("Error", "El timeout debe ser un número positivo.")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "El timeout debe ser un número válido.")
+            return
+        
         # Deshabilitar botón y mostrar progreso
         self.btn_ejecutar.config(state='disabled')
+        self.btn_cancelar.config(state='normal')
         self.progress.start()
+        self.status_label.config(text="Iniciando...")
         
         # Ejecutar en hilo separado
-        thread = threading.Thread(target=self.ejecutar_modelo_thread)
-        thread.daemon = True
-        thread.start()
-    
-    def mostrar_mensaje(self, mensaje):
-        """Agrega un mensaje al área de resultados"""
-        self.texto_resultados.insert(tk.END, mensaje)
-        self.texto_resultados.see(tk.END)
+        self.hilo_activo = threading.Thread(target=self.ejecutar_modelo_thread)
+        self.hilo_activo.daemon = True
+        self.hilo_activo.start()
     
     def limpiar_resultados(self):
         self.texto_resultados.delete(1.0, tk.END)
+        self.status_label.config(text="Listo para ejecutar")
     
     def guardar_resultados(self):
         contenido = self.texto_resultados.get(1.0, tk.END)
