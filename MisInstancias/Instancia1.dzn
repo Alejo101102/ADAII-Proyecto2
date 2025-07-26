@@ -1,0 +1,12 @@
+num_personas = 6;
+num_opiniones = 3;
+distribucion_inicial = [3,3,0];
+valores_extremismo = [0.7, 0.3, 0.0];
+costos_extra = [1.0, 1.0, 2.0];
+matriz_costos = [
+  [0, 2, 4],
+  [2, 0, 3],
+  [4, 3, 0]
+];
+costo_maximo = 10;
+movimientos_maximos = 4;
