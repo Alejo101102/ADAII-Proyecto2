@@ -6,12 +6,13 @@ import tempfile
 import threading
 import queue
 import time
+import re
 
 class MinExtGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Proyecto MinExt - Minimizar Extremismo en Poblaciones")
-        self.root.geometry("900x700")
+        self.root.geometry("1000x800")
         self.root.resizable(True, True)
         
         # Variables para almacenar rutas de archivos
@@ -49,7 +50,7 @@ class MinExtGUI:
         archivos_frame.columnconfigure(1, weight=1)
         
         # Archivo de entrada
-        ttk.Label(archivos_frame, text="Archivo de entrada (.txt):").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(archivos_frame, text="Archivo de entrada (.txt/.mext):").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         self.entrada_path = tk.StringVar()
         entrada_entry = ttk.Entry(archivos_frame, textvariable=self.entrada_path, state="readonly")
         entrada_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 5), pady=(0, 5))
@@ -70,7 +71,7 @@ class MinExtGUI:
         
         # Timeout
         ttk.Label(config_frame, text="Timeout (segundos):").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        self.timeout_var = tk.StringVar(value="300")  # 5 minutos por defecto
+        self.timeout_var = tk.StringVar(value="300")  
         timeout_entry = ttk.Entry(config_frame, textvariable=self.timeout_var, width=10)
         timeout_entry.grid(row=0, column=1, sticky=tk.W)
         
@@ -110,17 +111,33 @@ class MinExtGUI:
         self.status_label = ttk.Label(progress_frame, text="Listo para ejecutar")
         self.status_label.pack(pady=(5, 0))
         
-        # Área de resultados
-        resultados_frame = ttk.LabelFrame(main_frame, text="Resultados", padding="10")
-        resultados_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-        resultados_frame.columnconfigure(0, weight=1)
-        resultados_frame.rowconfigure(0, weight=1)
+        # Notebook para pestañas de resultados
+        notebook = ttk.Notebook(main_frame)
+        notebook.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
-        self.texto_resultados = scrolledtext.ScrolledText(resultados_frame, 
+        # Pestaña de resultados sin procesar
+        raw_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(raw_frame, text="Salida Completa")
+        raw_frame.columnconfigure(0, weight=1)
+        raw_frame.rowconfigure(0, weight=1)
+        
+        self.texto_resultados = scrolledtext.ScrolledText(raw_frame, 
                                                          wrap=tk.WORD, 
-                                                         height=20, 
+                                                         height=18, 
                                                          font=("Consolas", 10))
         self.texto_resultados.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Pestaña de resultados procesados
+        processed_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(processed_frame, text="Resultados Procesados")
+        processed_frame.columnconfigure(0, weight=1)
+        processed_frame.rowconfigure(0, weight=1)
+        
+        self.texto_procesado = scrolledtext.ScrolledText(processed_frame, 
+                                                        wrap=tk.WORD, 
+                                                        height=18, 
+                                                        font=("Arial", 11))
+        self.texto_procesado.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Frame para botones adicionales
         botones_frame = ttk.Frame(main_frame)
@@ -131,10 +148,219 @@ class MinExtGUI:
         ttk.Button(botones_frame, text="Guardar Resultados", 
                   command=self.guardar_resultados).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(botones_frame, text="Convertir TXT → DZN", 
-                  command=self.convertir_archivos).pack(side=tk.LEFT)
+                  command=self.convertir_archivos).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(botones_frame, text="Validar Entrada", 
+                  command=self.validar_entrada_manual).pack(side=tk.LEFT)
         
         # Configurar weights para redimensionamiento
         main_frame.rowconfigure(4, weight=1)
+    
+    def validar_formato_entrada(self, contenido):
+        """Validar que el archivo tenga el formato correcto según la Sección 3.1"""
+        try:
+            lineas = contenido.strip().split("\n")
+            
+            if len(lineas) < 7:
+                return False, "El archivo debe tener al menos 7 líneas"
+            
+            # número de personas (n)
+            try:
+                n = int(lineas[0].strip())
+                if n <= 0:
+                    return False, "El número de personas debe ser positivo"
+            except ValueError:
+                return False, "La primera línea debe contener un número entero (número de personas)"
+            
+            # número de opiniones (m)
+            try:
+                m = int(lineas[1].strip())
+                if m <= 0:
+                    return False, "El número de opiniones debe ser positivo"
+            except ValueError:
+                return False, "La segunda línea debe contener un número entero (número de opiniones)"
+            
+            # Verificar que hay suficientes líneas
+            lineas_esperadas = 5 + m + 2  # 5 líneas iniciales + m líneas de matriz + 2 líneas finales
+            if len(lineas) < lineas_esperadas:
+                return False, f"El archivo debe tener {lineas_esperadas} líneas para {m} opiniones. Encontradas: {len(lineas)}"
+            
+            # distribución inicial
+            try:
+                distribucion = [int(x.strip()) for x in lineas[2].split(',')]
+                if len(distribucion) != m:
+                    return False, f"La distribución inicial debe tener {m} valores, encontrados {len(distribucion)}"
+                if sum(distribucion) != n:
+                    return False, f"La suma de la distribución inicial ({sum(distribucion)}) debe ser igual al número de personas ({n})"
+                if any(x < 0 for x in distribucion):
+                    return False, "Los valores de distribución no pueden ser negativos"
+            except ValueError:
+                return False, "Error en el formato de la distribución inicial (línea 3)"
+            
+            # valores de extremismo
+            try:
+                extremismo = [float(x.strip()) for x in lineas[3].split(',')]
+                if len(extremismo) != m:
+                    return False, f"Los valores de extremismo deben ser {m}, encontrados {len(extremismo)}"
+                if any(x < 0 or x > 1 for x in extremismo):
+                    return False, "Los valores de extremismo deben estar entre 0 y 1"
+            except ValueError:
+                return False, "Error en el formato de los valores de extremismo (línea 4)"
+            
+            # costos extra
+            try:
+                costos_extra = [float(x.strip()) for x in lineas[4].split(',')]
+                if len(costos_extra) != m:
+                    return False, f"Los costos extra deben ser {m}, encontrados {len(costos_extra)}"
+                if any(x < 0 for x in costos_extra):
+                    return False, "Los costos extra no pueden ser negativos"
+            except ValueError:
+                return False, "Error en el formato de los costos extra (línea 5)"
+            
+            # matriz de costos
+            for i in range(m):
+                try:
+                    fila = [float(x.strip()) for x in lineas[5 + i].split(',')]
+                    if len(fila) != m:
+                        return False, f"La fila {i+1} de la matriz de costos debe tener {m} valores, encontrados {len(fila)}"
+                    if any(x < 0 for x in fila):
+                        return False, f"Los costos en la fila {i+1} no pueden ser negativos"
+                    if fila[i] != 0:
+                        return False, f"El costo de la opinión {i+1} a sí misma debe ser 0"
+                except ValueError:
+                    return False, f"Error en el formato de la fila {i+1} de la matriz de costos"
+            
+            #  costo máximo
+            try:
+                costo_max = float(lineas[5 + m].strip())
+                if costo_max < 0:
+                    return False, "El costo máximo no puede ser negativo"
+            except ValueError:
+                return False, "Error en el formato del costo máximo"
+            
+            # movimientos máximos
+            try:
+                mov_max = int(lineas[5 + m + 1].strip())
+                if mov_max < 0:
+                    return False, "Los movimientos máximos no pueden ser negativos"
+            except ValueError:
+                return False, "Error en el formato de movimientos máximos"
+            
+            return True, f"Archivo válido: {n} personas, {m} opiniones"
+            
+        except Exception as e:
+            return False, f"Error inesperado durante la validación: {str(e)}"
+    
+    def parsear_resultados_minizinc(self, salida):
+        """Parsea la salida de MiniZinc para extraer información relevante"""
+        resultado_parseado = []
+        
+        try:
+            lineas = salida.split('\n')
+            
+            # Buscar información del solver y estadísticas
+            for linea in lineas:
+                linea = linea.strip()
+                
+                # Información del solver
+                if "% solver:" in linea.lower() or "solver:" in linea.lower():
+                    resultado_parseado.append(f"Solver utilizado: {linea}")
+                
+                # Tiempo de ejecución
+                if "time elapsed:" in linea.lower() or "solving time:" in linea.lower():
+                    resultado_parseado.append(f" {linea}")
+                
+                # Estado de la solución
+                if linea in ["=====OPTIMAL=====", "=====SATISFIABLE=====", "=====UNSATISFIABLE=====", 
+                           "=====UNKNOWN=====", "=====UNBOUNDED=====", "=====ERROR====="]:
+                    estado_map = {
+                        "=====OPTIMAL=====": "SOLUCIÓN ÓPTIMA ENCONTRADA",
+                        "=====SATISFIABLE=====": "SOLUCIÓN FACTIBLE ENCONTRADA",
+                        "=====UNSATISFIABLE=====": "NO HAY SOLUCIÓN FACTIBLE",
+                        "=====UNKNOWN=====": "ESTADO DESCONOCIDO",
+                        "=====UNBOUNDED=====": "PROBLEMA NO ACOTADO",
+                        "=====ERROR=====": " ERROR EN LA EJECUCIÓN"
+                    }
+                    resultado_parseado.append(f"\n{estado_map.get(linea, linea)}\n")
+                
+                # Variables de decisión
+                if "=" in linea and not linea.startswith("%") and not linea.startswith("====="):
+                    if any(keyword in linea.lower() for keyword in ['extremismo', 'costo', 'movimientos', 'x_']):
+                        resultado_parseado.append(f" {linea}")
+                
+                # Función objetivo
+                if linea.startswith("Extremismo final:") or "objetivo:" in linea.lower():
+                    resultado_parseado.append(f" {linea}")
+            
+            # Buscar matriz de movimientos si existe
+            matriz_movimientos = []
+            capturando_matriz = False
+            
+            for linea in lineas:
+                if "movimientos:" in linea.lower() or "matriz" in linea.lower():
+                    capturando_matriz = True
+                    continue
+                
+                if capturando_matriz and linea.strip():
+                    if linea.startswith("[") or "|" in linea:
+                        matriz_movimientos.append(linea.strip())
+                    else:
+                        capturando_matriz = False
+            
+            if matriz_movimientos:
+                resultado_parseado.append("\n📋 MATRIZ DE MOVIMIENTOS:")
+                for fila in matriz_movimientos:
+                    resultado_parseado.append(f"   {fila}")
+            
+            # Si no hay contenido parseado, mostrar mensaje
+            if not resultado_parseado:
+                resultado_parseado.append(" No se pudo extraer información estructurada de los resultados.")
+                resultado_parseado.append("Revisa la pestaña 'Salida Completa' para ver todos los detalles.")
+            
+            return "\n".join(resultado_parseado)
+            
+        except Exception as e:
+            return f" Error al parsear resultados: {str(e)}\n\nRevisa la pestaña 'Salida Completa' para ver la salida original."
+    
+    def manejar_errores_minizinc(self, stderr, returncode):
+        """Maneja errores específicos de MiniZinc y proporciona mensajes útiles"""
+        mensajes_error = []
+        
+        # Errores comunes de MiniZinc
+        errores_conocidos = {
+            "syntax error": " Error de sintaxis en el modelo MiniZinc",
+            "type error": "Error de tipos en el modelo",
+            "assertion failed": " Fallo en una aserción del modelo",
+            "unsatisfiable": " El problema no tiene solución factible",
+            "timeout": "Tiempo límite excedido",
+            "memory": " Error de memoria insuficiente",
+            "file not found": " Archivo no encontrado",
+            "permission denied": "Permisos insuficientes para acceder al archivo"
+        }
+        
+        error_encontrado = False
+        for patron, mensaje in errores_conocidos.items():
+            if patron in stderr.lower():
+                mensajes_error.append(mensaje)
+                error_encontrado = True
+                break
+        
+        if not error_encontrado:
+            if returncode != 0:
+                mensajes_error.append(f" Error de ejecución (código: {returncode})")
+        
+        # Sugerencias basadas en el tipo de error
+        if "syntax error" in stderr.lower():
+            mensajes_error.append(" Sugerencia: Revisa la sintaxis del archivo .mzn")
+        elif "type error" in stderr.lower():
+            mensajes_error.append(" Sugerencia: Verifica los tipos de datos en el modelo")
+        elif "unsatisfiable" in stderr.lower():
+            mensajes_error.append(" Sugerencia: Reduce las restricciones o aumenta los límites")
+        elif "timeout" in stderr.lower():
+            mensajes_error.append(" Sugerencia: Aumenta el tiempo límite o usa un solver más rápido")
+        elif "file not found" in stderr.lower():
+            mensajes_error.append("Sugerencia: Verifica que los archivos existan y las rutas sean correctas")
+        
+        return "\n".join(mensajes_error) if mensajes_error else None
     
     def iniciar_monitor_cola(self):
         """Monitorea la cola de mensajes y actualiza la interfaz"""
@@ -145,6 +371,9 @@ class MinExtGUI:
                 if mensaje_tipo == "texto":
                     self.texto_resultados.insert(tk.END, contenido)
                     self.texto_resultados.see(tk.END)
+                elif mensaje_tipo == "texto_procesado":
+                    self.texto_procesado.delete(1.0, tk.END)
+                    self.texto_procesado.insert(1.0, contenido)
                 elif mensaje_tipo == "status":
                     self.status_label.config(text=contenido)
                 elif mensaje_tipo == "finalizar":
@@ -165,8 +394,49 @@ class MinExtGUI:
             filetypes=[("Archivos de texto", "*.txt"), ("Archivos MinExt", "*.mext"), ("Todos los archivos", "*.*")]
         )
         if archivo:
-            self.archivo_entrada = archivo
-            self.entrada_path.set(archivo)
+            # Validar archivo al seleccionarlo
+            try:
+                with open(archivo, 'r', encoding='utf-8') as f:
+                    contenido = f.read()
+                
+                es_valido, mensaje = self.validar_formato_entrada(contenido)
+                if es_valido:
+                    self.archivo_entrada = archivo
+                    self.entrada_path.set(archivo)
+                    self.status_label.config(text=f" {mensaje}")
+                else:
+                    respuesta = messagebox.askyesno(
+                        "Archivo con errores", 
+                        f"Se encontraron errores en el archivo:\n\n{mensaje}\n\n¿Deseas seleccionarlo de todas formas?"
+                    )
+                    if respuesta:
+                        self.archivo_entrada = archivo
+                        self.entrada_path.set(archivo)
+                        self.status_label.config(text=" Archivo seleccionado con advertencias")
+                    else:
+                        self.status_label.config(text=" Archivo no seleccionado")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al leer el archivo:\n{str(e)}")
+    
+    def validar_entrada_manual(self):
+        """Valida manualmente el archivo de entrada seleccionado"""
+        if not self.archivo_entrada or not os.path.exists(self.archivo_entrada):
+            messagebox.showwarning("Advertencia", "Por favor selecciona primero un archivo de entrada válido.")
+            return
+        
+        try:
+            with open(self.archivo_entrada, 'r', encoding='utf-8') as f:
+                contenido = f.read()
+            
+            es_valido, mensaje = self.validar_formato_entrada(contenido)
+            
+            if es_valido:
+                messagebox.showinfo("Validación exitosa", f"{mensaje}")
+            else:
+                messagebox.showerror("Errores encontrados", f"{mensaje}")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al validar el archivo:\n{str(e)}")
     
     def seleccionar_archivo_modelo(self):
         archivo = filedialog.askopenfilename(
@@ -232,11 +502,16 @@ class MinExtGUI:
                 return
 
             # Actualizar status
-            self.mensaje_queue.put(("status", "Leyendo archivos..."))
+            self.mensaje_queue.put(("status", "Validando archivos..."))
             
-            # Leer archivo de entrada
+            # Leer y validar archivo de entrada
             with open(self.archivo_entrada, 'r', encoding='utf-8') as f:
                 contenido_entrada = f.read()
+            
+            es_valido, mensaje_validacion = self.validar_formato_entrada(contenido_entrada)
+            if not es_valido:
+                self.mensaje_queue.put(("error", f"El archivo de entrada no es válido:\n\n{mensaje_validacion}"))
+                return
 
             # Convertir a formato DZN
             self.mensaje_queue.put(("status", "Convirtiendo formato..."))
@@ -252,6 +527,7 @@ class MinExtGUI:
             self.mensaje_queue.put(("texto", f"Inicio: {time.strftime('%H:%M:%S')}\n"))
             self.mensaje_queue.put(("texto", f"Archivo de entrada: {os.path.basename(self.archivo_entrada)}\n"))
             self.mensaje_queue.put(("texto", f"Archivo de modelo: {os.path.basename(self.archivo_modelo)}\n"))
+            self.mensaje_queue.put(("texto", f"Validación: {mensaje_validacion}\n"))
 
             # Construir comando optimizado
             cmd = ['minizinc']
@@ -280,8 +556,8 @@ class MinExtGUI:
             
             # Optimizaciones adicionales
             cmd.extend([
-                '--statistics',  # Mostrar estadísticas
-                '--verbose-solving'  # Información del proceso de resolución
+                '--statistics',
+                '--verbose-solving' 
             ])
             
             # Añadir archivos
@@ -298,7 +574,7 @@ class MinExtGUI:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
-                bufsize=1,  # Buffer de línea para salida inmediata
+                bufsize=1,
                 universal_newlines=True
             )
 
@@ -316,7 +592,7 @@ class MinExtGUI:
                     if line:
                         stdout_lines.append(line)
                         # Mostrar líneas importantes inmediatamente
-                        if any(keyword in line.lower() for keyword in ['extremismo', 'costo', 'movimientos', 'resultado']):
+                        if any(keyword in line.lower() for keyword in ['extremismo', 'costo', 'movimientos', 'resultado', 'optimal', 'satisfiable']):
                             self.mensaje_queue.put(("texto", line))
                 except:
                     break
@@ -337,15 +613,26 @@ class MinExtGUI:
             if self.proceso_activo.returncode == 0:
                 self.mensaje_queue.put(("texto", f"\n=== RESULTADOS ({elapsed_time:.2f}s) ===\n"))
                 self.mensaje_queue.put(("texto", stdout))
+                
+                # Parsear y mostrar resultados procesados
+                resultados_parseados = self.parsear_resultados_minizinc(stdout)
+                self.mensaje_queue.put(("texto_procesado", resultados_parseados))
+                
                 if stderr:
                     self.mensaje_queue.put(("texto", "\n=== INFORMACIÓN DEL SOLVER ===\n"))
                     self.mensaje_queue.put(("texto", stderr))
                 self.mensaje_queue.put(("status", f"Completado en {elapsed_time:.2f}s"))
             else:
+                # Manejar errores específicos de MiniZinc
                 error_msg = stderr if stderr else stdout
+                mensaje_error = self.manejar_errores_minizinc(error_msg, self.proceso_activo.returncode)
+                
                 self.mensaje_queue.put(("texto", f"\n=== ERROR ({elapsed_time:.2f}s) ===\n"))
-                self.mensaje_queue.put(("texto", error_msg))
-                self.mensaje_queue.put(("status", "Error en la ejecución"))
+                if mensaje_error:
+                    self.mensaje_queue.put(("texto", mensaje_error + "\n\n"))
+                self.mensaje_queue.put(("texto", f"Salida original del error:\n{error_msg}"))
+                self.mensaje_queue.put(("texto_procesado", f"EJECUCIÓN FALLIDA\n\n{mensaje_error or 'Error desconocido'}\n\nRevisa la pestaña 'Salida Completa' para más detalles."))
+                self.mensaje_queue.put(("status", f" Error en la ejecución ({elapsed_time:.2f}s)"))
 
         except Exception as e:
             elapsed_time = time.time() - start_time
@@ -369,7 +656,8 @@ class MinExtGUI:
             try:
                 self.proceso_activo.terminate()
                 self.mensaje_queue.put(("texto", "\n=== EJECUCIÓN CANCELADA ===\n"))
-                self.mensaje_queue.put(("status", "Cancelado por el usuario"))
+                self.mensaje_queue.put(("texto_procesado", " EJECUCIÓN CANCELADA POR EL USUARIO"))
+                self.mensaje_queue.put(("status", " Cancelado por el usuario"))
             except:
                 pass
         
@@ -396,11 +684,24 @@ class MinExtGUI:
             messagebox.showerror("Error", "El timeout debe ser un número válido.")
             return
         
+        # Validar archivos antes de ejecutar
+        if not self.archivo_entrada or not os.path.exists(self.archivo_entrada):
+            messagebox.showerror("Error", "Por favor selecciona un archivo de entrada válido.")
+            return
+            
+        if not self.archivo_modelo or not os.path.exists(self.archivo_modelo):
+            messagebox.showerror("Error", "Por favor selecciona un archivo de modelo válido.")
+            return
+        
         # Deshabilitar botón y mostrar progreso
         self.btn_ejecutar.config(state='disabled')
         self.btn_cancelar.config(state='normal')
         self.progress.start()
-        self.status_label.config(text="Iniciando...")
+        self.status_label.config(text=" Iniciando...")
+        
+        # Limpiar resultados previos
+        self.texto_resultados.delete(1.0, tk.END)
+        self.texto_procesado.delete(1.0, tk.END)
         
         # Ejecutar en hilo separado
         self.hilo_activo = threading.Thread(target=self.ejecutar_modelo_thread)
@@ -409,31 +710,55 @@ class MinExtGUI:
     
     def limpiar_resultados(self):
         self.texto_resultados.delete(1.0, tk.END)
+        self.texto_procesado.delete(1.0, tk.END)
         self.status_label.config(text="Listo para ejecutar")
     
     def guardar_resultados(self):
-        contenido = self.texto_resultados.get(1.0, tk.END)
+        # Preguntar qué tipo de resultados guardar
+        respuesta = messagebox.askyesnocancel(
+            "Tipo de resultados", 
+            "¿Qué tipo de resultados deseas guardar?\n\n"
+            "Sí: Resultados procesados (más legibles)\n"
+            "No: Salida completa (formato original)\n"
+            "Cancelar: No guardar nada"
+        )
+        
+        if respuesta is None:  # Cancelar
+            return
+        
+        if respuesta:  # Sí - Resultados procesados
+            contenido = self.texto_procesado.get(1.0, tk.END)
+            tipo = "procesados"
+        else:  # No - Salida completa
+            contenido = self.texto_resultados.get(1.0, tk.END)
+            tipo = "completos"
+        
         if contenido.strip():
             archivo = filedialog.asksaveasfilename(
-                title="Guardar resultados",
+                title=f"Guardar resultados {tipo}",
                 defaultextension=".txt",
                 filetypes=[("Archivos de texto", "*.txt"), ("Todos los archivos", "*.*")]
             )
             if archivo:
                 try:
                     with open(archivo, 'w', encoding='utf-8') as f:
+                        f.write(f"=== RESULTADOS MINEXT ({tipo.upper()}) ===\n")
+                        f.write(f"Generado: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"Archivo entrada: {os.path.basename(self.archivo_entrada) if self.archivo_entrada else 'N/A'}\n")
+                        f.write(f"Archivo modelo: {os.path.basename(self.archivo_modelo) if self.archivo_modelo else 'N/A'}\n")
+                        f.write("=" * 50 + "\n\n")
                         f.write(contenido)
-                    messagebox.showinfo("Éxito", "Resultados guardados correctamente.")
+                    messagebox.showinfo("Éxito", f"Resultados {tipo} guardados correctamente.")
                 except Exception as e:
                     messagebox.showerror("Error", f"Error al guardar: {str(e)}")
         else:
             messagebox.showwarning("Advertencia", "No hay resultados para guardar.")
     
     def convertir_archivos(self):
-        """Función para convertir archivos TXT a DZN"""
+        """Función para convertir archivos TXT a DZN con validación mejorada"""
         archivos = filedialog.askopenfilenames(
-            title="Selecciona los archivos .txt",
-            filetypes=[("Archivos de texto", "*.txt"), ("Archivos MinExt", "*.mext")]
+            title="Selecciona los archivos .txt/.mext",
+            filetypes=[("Archivos soportados", "*.txt;*.mext"), ("Archivos de texto", "*.txt"), ("Archivos MinExt", "*.mext")]
         )
 
         if not archivos:
@@ -444,25 +769,49 @@ class MinExtGUI:
             return
 
         convertidos = 0
+        errores = []
+        
         for ruta in archivos:
             try:
                 with open(ruta, "r", encoding='utf-8') as archivo:
                     contenido = archivo.read()
+                
+                # Validar antes de convertir
+                es_valido, mensaje = self.validar_formato_entrada(contenido)
+                if not es_valido:
+                    errores.append(f"{os.path.basename(ruta)}: {mensaje}")
+                    continue
+                
                 contenido_dzn = self.convertir_contenido_txt_a_dzn(contenido)
 
                 nombre_base = os.path.splitext(os.path.basename(ruta))[0]
                 ruta_salida = os.path.join(carpeta_salida, nombre_base + ".dzn")
 
                 with open(ruta_salida, "w", encoding='utf-8') as salida:
+                    salida.write(f"% Archivo DZN generado automáticamente\n")
+                    salida.write(f"% Origen: {os.path.basename(ruta)}\n")
+                    salida.write(f"% Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     salida.write(contenido_dzn)
                 
                 convertidos += 1
 
             except Exception as e:
-                messagebox.showerror("Error", f"Error con el archivo {ruta}:\n{str(e)}")
-                return
+                errores.append(f"{os.path.basename(ruta)}: {str(e)}")
 
-        messagebox.showinfo("Conversión exitosa", f"{convertidos} archivos convertidos correctamente.")
+        # Mostrar resultados de la conversión
+        mensaje_resultado = f"{convertidos} archivos convertidos correctamente."
+        
+        if errores:
+            mensaje_resultado += f"\n\nErrores en {len(errores)} archivos:\n"
+            for error in errores[:5]:  # Mostrar máximo 5 errores
+                mensaje_resultado += f"• {error}\n"
+            if len(errores) > 5:
+                mensaje_resultado += f"... y {len(errores) - 5} errores más."
+        
+        if convertidos > 0:
+            messagebox.showinfo("Conversión completada", mensaje_resultado)
+        else:
+            messagebox.showerror("Error en conversión", mensaje_resultado)
 
 def main():
     root = tk.Tk()
@@ -477,7 +826,14 @@ def main():
     elif 'vista' in available_themes:
         style.theme_use('vista')
     
+    # Configurar estilos personalizados
+    style.configure("Accent.TButton", font=("Arial", 10, "bold"))
+    
     app = MinExtGUI(root)
+    
+    # Mostrar mensaje de bienvenida
+    root.after(1000, lambda: app.status_label.config(text="Selecciona los archivos de entrada y modelo para comenzar"))
+    
     root.mainloop()
 
 if __name__ == "__main__":
